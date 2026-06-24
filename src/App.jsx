@@ -6,15 +6,17 @@ import { APP_CONFIG } from './config/appConfig'
 import {
   calculateHeightForWidth,
   calculateWidthForHeight,
-  fitImageSizeForBaseY,
 } from './utils/imageSizing'
 import { clamp, numberValue } from './utils/math'
 
 const initialSettings = APP_CONFIG.defaults
 
 function sanitizeSettings(settings) {
+  const useFastSolving = Boolean(settings.useFastSolving)
+
   return {
     ...settings,
+    useFastSolving,
     startX: Math.round(numberValue(settings.startX)),
     startY: Math.round(numberValue(settings.startY)),
     startZ: Math.round(numberValue(settings.startZ)),
@@ -23,11 +25,13 @@ function sanitizeSettings(settings) {
     commandLimit: Math.max(1, Math.round(numberValue(settings.commandLimit, 20_000))),
     resultWidth: Math.max(1, Math.round(numberValue(settings.resultWidth, 1))),
     resultHeight: Math.max(1, Math.round(numberValue(settings.resultHeight, 1))),
+    skipTransparentPixels: true,
     transparentAlphaThreshold: Math.round(numberValue(settings.transparentAlphaThreshold)),
+    cleanTransparentResizeEdges: true,
     buildMaskCoverageThreshold: Math.round(numberValue(settings.buildMaskCoverageThreshold, 128)),
     imageMaxColors: Math.max(0, Math.round(numberValue(settings.imageMaxColors))),
     minLayers: Math.max(0, Math.round(numberValue(settings.minLayers))),
-    maxLayers: Math.max(0, Math.round(numberValue(settings.maxLayers))),
+    maxLayers: useFastSolving ? 6 : Math.max(1, Math.round(numberValue(settings.maxLayers))),
     perColorBeamWidth: Math.max(1, Math.round(numberValue(settings.perColorBeamWidth, 96))),
     solverColorBinSize: Math.max(1, Math.round(numberValue(settings.solverColorBinSize, 2))),
     newLayerMinImprovement: Math.max(0, numberValue(settings.newLayerMinImprovement, 0.35)),
@@ -40,15 +44,8 @@ function sanitizeSettings(settings) {
   }
 }
 
-function autoDownload(blob, fileName) {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = fileName
-  document.body.append(anchor)
-  anchor.click()
-  anchor.remove()
-  return url
+function createDownloadUrl(blob) {
+  return URL.createObjectURL(blob)
 }
 
 function App() {
@@ -88,21 +85,14 @@ function App() {
     const errors = []
 
     if (!image) errors.push('Import an image before generating.')
-    if (!settings.datapackName.trim()) errors.push('Datapack name is required.')
-    if (!/^[a-z0-9_.-]+$/.test(settings.namespace)) {
-      errors.push('Namespace must use lowercase letters, numbers, underscores, dots, or hyphens.')
-    }
+    if (!settings.schematicFileName.trim()) errors.push('Schematic file name is required.')
     if (targetSize.width < 1 || targetSize.height < 1) errors.push('Image resolution must be positive.')
-    if (numberValue(settings.startY) + targetSize.height - 1 > APP_CONFIG.minecraft.maxY) {
-      errors.push(`Build exceeds Minecraft max Y ${APP_CONFIG.minecraft.maxY}. Lower Base Y or height.`)
+    if (!settings.useFastSolving && numberValue(settings.maxLayers) < numberValue(settings.minLayers)) {
+      errors.push('Max layers must be at least 1.')
     }
-    if (numberValue(settings.startY) < APP_CONFIG.minecraft.minY) {
-      errors.push(`Base Y is below Minecraft min Y ${APP_CONFIG.minecraft.minY}.`)
+    if (!settings.useFastSolving && !settings.glassColorNames.length) {
+      errors.push('At least one color must be enabled.')
     }
-    if (numberValue(settings.maxLayers) < numberValue(settings.minLayers)) {
-      errors.push('Max layers must be greater than or equal to min layers.')
-    }
-    if (!settings.glassColorNames.length) errors.push('At least one color must be enabled.')
     return errors
   }, [image, settings, targetSize.height, targetSize.width])
 
@@ -136,13 +126,16 @@ function App() {
     async (file) => {
       if (!file?.type.startsWith('image/')) return
       const bitmap = await createImageBitmap(file)
-      const fittedSize = fitImageSizeForBaseY(
-        bitmap,
-        settings.resultWidth || APP_CONFIG.defaults.resultWidth,
-        settings.startY,
-      )
+      const nextImage = { name: file.name || 'clipboard-image.png', width: bitmap.width, height: bitmap.height }
+      const preferredHeight = Math.max(1, Math.round(numberValue(settings.resultHeight, APP_CONFIG.defaults.resultHeight)))
+      const fittedSize = settings.lockAspectRatio
+        ? { width: calculateWidthForHeight(nextImage, preferredHeight), height: preferredHeight }
+        : {
+            width: Math.max(1, Math.round(numberValue(settings.resultWidth, APP_CONFIG.defaults.resultWidth))),
+            height: preferredHeight,
+          }
       fileRef.current = file
-      setImage({ name: file.name || 'clipboard-image.png', width: bitmap.width, height: bitmap.height })
+      setImage(nextImage)
       setSettings((current) => ({
         ...current,
         resultWidth: fittedSize.width,
@@ -155,7 +148,7 @@ function App() {
       clearDownload()
       bitmap.close?.()
     },
-    [clearDownload, settings.resultWidth, settings.startY],
+    [clearDownload, settings.lockAspectRatio, settings.resultHeight, settings.resultWidth],
   )
 
   const removeImage = useCallback(() => {
@@ -230,12 +223,23 @@ function App() {
   const startGeneration = useCallback(async () => {
     if (validation.length || !fileRef.current) return
 
-    clearDownload()
-    setStats(null)
+    const overlayCanvas = overlayCanvasRef.current
+    const previousResult = download
+      ? {
+          download,
+          stats,
+          overlay:
+            overlayCanvas.width > 0 && overlayCanvas.height > 0
+              ? overlayCanvas.getContext('2d').getImageData(0, 0, overlayCanvas.width, overlayCanvas.height)
+              : null,
+          overlayWidth: overlayCanvas.width,
+          overlayHeight: overlayCanvas.height,
+        }
+      : null
+
     setRuntimeError('')
     setGeneration({ status: 'running', progress: 0, label: 'Preparing image' })
 
-    const overlayCanvas = overlayCanvasRef.current
     overlayCanvas.width = targetSize.width
     overlayCanvas.height = targetSize.height
     const overlayContext = overlayCanvas.getContext('2d')
@@ -275,23 +279,38 @@ function App() {
         setGeneration({
           status: 'running',
           progress: Math.max(5, Math.round((message.solvedColors / message.uniqueColors) * 94)),
-          label: `Solved ${message.solvedColors} of ${message.uniqueColors} colors`,
+          label: message.label || `Solved ${message.solvedColors} of ${message.uniqueColors} colors`,
         })
       }
 
       if (message.type === 'done') {
-        const url = autoDownload(message.zipBlob, message.fileName)
+        const url = createDownloadUrl(message.schematicBlob)
+        if (downloadUrlRef.current) URL.revokeObjectURL(downloadUrlRef.current)
         downloadUrlRef.current = url
         setDownload({ url, fileName: message.fileName })
         setStats(message.stats)
-        setGeneration({ status: 'done', progress: 100, label: 'Datapack downloaded' })
+        setGeneration({ status: 'done', progress: 100, label: 'Schematic ready' })
         worker.terminate()
         workerRef.current = null
       }
 
       if (message.type === 'cancelled') {
-        overlayCanvas.getContext('2d').clearRect(0, 0, overlayCanvas.width, overlayCanvas.height)
-        setGeneration({ status: 'idle', progress: 0, label: '' })
+        if (previousResult?.overlay) {
+          overlayCanvas.width = previousResult.overlayWidth
+          overlayCanvas.height = previousResult.overlayHeight
+          overlayImageRef.current = previousResult.overlay
+          overlayCanvas.getContext('2d').putImageData(previousResult.overlay, 0, 0)
+        } else {
+          overlayCanvas.getContext('2d').clearRect(0, 0, overlayCanvas.width, overlayCanvas.height)
+          overlayImageRef.current = null
+        }
+        setDownload(previousResult?.download ?? null)
+        setStats(previousResult?.stats ?? null)
+        setGeneration(
+          previousResult
+            ? { status: 'done', progress: 100, label: 'Schematic ready' }
+            : { status: 'idle', progress: 0, label: '' },
+        )
         worker.terminate()
         workerRef.current = null
       }
@@ -311,7 +330,7 @@ function App() {
       fileType: fileRef.current.type,
       settings: sanitizeSettings(settings),
     })
-  }, [clearDownload, settings, targetSize.height, targetSize.width, validation])
+  }, [download, settings, stats, targetSize.height, targetSize.width, validation])
 
   const confirmStop = useCallback(() => {
     workerRef.current?.postMessage({ type: 'cancel' })
@@ -455,7 +474,6 @@ function App() {
 
         <ConfigPanel
           settings={settings}
-          targetSize={targetSize}
           validation={validation}
           runtimeError={runtimeError}
           generation={generation}

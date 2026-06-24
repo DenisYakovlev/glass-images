@@ -1,11 +1,32 @@
-import JSZip from 'jszip'
+import { gzip } from 'pako'
 import { APP_CONFIG, GLASS_RGBA } from '../config/appConfig'
 
 let cancelled = false
 const colorCache = new Map()
+const lutCache = new Map()
+
+const GLASS_LUT_COLOR_NAMES = [
+  'white',
+  'orange',
+  'magenta',
+  'light_blue',
+  'yellow',
+  'lime',
+  'pink',
+  'gray',
+  'light_gray',
+  'cyan',
+  'purple',
+  'blue',
+  'brown',
+  'green',
+  'red',
+  'black',
+]
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 const sleep = () => new Promise((resolve) => setTimeout(resolve, 0))
+const clampByte = (value) => clamp(Math.round(Number(value) || 0), 0, 255)
 
 function normalizeGlassName(name) {
   return String(name)
@@ -36,6 +57,134 @@ function rgbDistanceSq(a, b) {
 
 function rgbDistance(a, b) {
   return Math.sqrt(rgbDistanceSq(a, b))
+}
+
+function renderLutStackRgb(stackIndexes) {
+  const alpha = GLASS_RGBA.white[3]
+  let r = 255
+  let g = 255
+  let b = 255
+
+  for (const glassIndex of stackIndexes) {
+    const glass = GLASS_RGBA[GLASS_LUT_COLOR_NAMES[glassIndex]]
+    r = r * (1 - alpha) + glass[0] * alpha
+    g = g * (1 - alpha) + glass[1] * alpha
+    b = b * (1 - alpha) + glass[2] * alpha
+  }
+
+  return [Math.round(r), Math.round(g), Math.round(b)]
+}
+
+async function loadGlassLutQ32(url = '/lut_q32.glut') {
+  const cached = lutCache.get(url)
+  if (cached) return cached
+
+  const promise = fetch(url)
+    .then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`Failed to load LUT: ${response.status} ${response.statusText}`)
+      }
+
+      const bytes = new Uint8Array(await response.arrayBuffer())
+
+      if (bytes.length < 8) {
+        throw new Error('Invalid GLUT file: too small')
+      }
+
+      const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3])
+      if (magic !== 'GLUT') {
+        throw new Error(`Invalid GLUT magic: ${magic}`)
+      }
+
+      const version = bytes[4]
+      const gridSize = bytes[5]
+      const layers = bytes[6]
+
+      if (version !== 1) throw new Error(`Unsupported GLUT version: ${version}`)
+      if (gridSize !== 32) throw new Error(`Expected q32 LUT, got q${gridSize}`)
+      if (layers !== 6) throw new Error(`Expected 6 glass layers, got ${layers}`)
+
+      const headerSize = 8
+      const expectedSize = headerSize + gridSize * gridSize * gridSize * 3
+      if (bytes.length !== expectedSize) {
+        throw new Error(`Invalid GLUT size: got ${bytes.length}, expected ${expectedSize}`)
+      }
+
+      function readStackAtIndex(qIndex) {
+        const offset = headerSize + qIndex * 3
+        const b0 = bytes[offset]
+        const b1 = bytes[offset + 1]
+        const b2 = bytes[offset + 2]
+        return [b0 >> 4, b0 & 15, b1 >> 4, b1 & 15, b2 >> 4, b2 & 15]
+      }
+
+      function readStackAtGrid(rq, gq, bq) {
+        return readStackAtIndex((rq * gridSize + gq) * gridSize + bq)
+      }
+
+      function getStackIndexes(r, g, b) {
+        return readStackAtGrid(clampByte(r) >> 3, clampByte(g) >> 3, clampByte(b) >> 3)
+      }
+
+      function getBestStackIndexes(r, g, b) {
+        const target = [clampByte(r), clampByte(g), clampByte(b)]
+        const rf = target[0] / 8
+        const gf = target[1] / 8
+        const bf = target[2] / 8
+
+        const r0 = clamp(Math.floor(rf), 0, 31)
+        const g0 = clamp(Math.floor(gf), 0, 31)
+        const b0 = clamp(Math.floor(bf), 0, 31)
+        const r1 = clamp(r0 + 1, 0, 31)
+        const g1 = clamp(g0 + 1, 0, 31)
+        const b1 = clamp(b0 + 1, 0, 31)
+
+        let bestStack = null
+        let bestDistance = Number.POSITIVE_INFINITY
+        const seen = new Set()
+        const candidates = [
+          [r0, g0, b0],
+          [r1, g0, b0],
+          [r0, g1, b0],
+          [r0, g0, b1],
+          [r1, g1, b0],
+          [r1, g0, b1],
+          [r0, g1, b1],
+          [r1, g1, b1],
+        ]
+
+        for (const [rq, gq, bq] of candidates) {
+          const key = `${rq},${gq},${bq}`
+          if (seen.has(key)) continue
+          seen.add(key)
+
+          const stack = readStackAtGrid(rq, gq, bq)
+          const distance = rgbDistanceSq(target, renderLutStackRgb(stack))
+          if (distance < bestDistance) {
+            bestDistance = distance
+            bestStack = stack
+          }
+        }
+
+        return bestStack
+      }
+
+      return {
+        gridSize,
+        layers,
+        readStackAtIndex,
+        getStackIndexes,
+        getBestStackIndexes,
+        renderStackRgb: renderLutStackRgb,
+      }
+    })
+    .catch((error) => {
+      lutCache.delete(url)
+      throw error
+    })
+
+  lutCache.set(url, promise)
+  return promise
 }
 
 function quantizedColorKey(color, binSize) {
@@ -302,6 +451,41 @@ function buildColorGroups(target) {
   return { groups: [...groups.values()], buildablePixels }
 }
 
+function q32IndexFromRgb(target, pixelIndex) {
+  const rgbIndex = pixelIndex * 3
+  return ((target.rgb[rgbIndex] >> 3) * 32 + (target.rgb[rgbIndex + 1] >> 3)) * 32 + (target.rgb[rgbIndex + 2] >> 3)
+}
+
+function rgbFromQ32Index(q32Index) {
+  const rq = q32Index >> 10
+  const gq = (q32Index >> 5) & 31
+  const bq = q32Index & 31
+  return [
+    Math.min(255, rq * 8 + 4),
+    Math.min(255, gq * 8 + 4),
+    Math.min(255, bq * 8 + 4),
+  ]
+}
+
+function summarizeFastLutTarget(target) {
+  const seenQ32 = new Uint8Array(32 * 32 * 32)
+  let buildablePixels = 0
+  let uniqueColors = 0
+
+  for (let index = 0; index < target.width * target.height; index += 1) {
+    if (!target.mask[index]) continue
+    buildablePixels += 1
+
+    const q32Index = q32IndexFromRgb(target, index)
+    if (!seenQ32[q32Index]) {
+      seenQ32[q32Index] = 1
+      uniqueColors += 1
+    }
+  }
+
+  return { buildablePixels, uniqueColors }
+}
+
 function buildPalette(states) {
   const stackToIndex = new Map()
   const stacks = []
@@ -325,164 +509,344 @@ function buildPalette(states) {
   return { stacks, colors, lengths, indexes }
 }
 
-function imageYToBlockY(py, height, settings) {
-  if (settings.imageTopToHighY) return Number(settings.startY) + (height - 1 - py)
-  return Number(settings.startY) + py
-}
+async function buildFastLutSolution(target, lut, summary) {
+  const q32ToPaletteIndex = new Int32Array(32 * 32 * 32).fill(-1)
+  const stackToIndex = new Map()
+  const stacks = []
+  const colors = []
+  const lengths = []
+  const paletteIndexesByPixel = new Int32Array(target.width * target.height).fill(-1)
+  const batchIndexes = []
+  const batchColors = []
+  const overlayBatchSize = 8192
+  const yieldBatchSize = 16384
 
-function rowFillCommand(py, x0, x1, layerIndex, blockState, area, settings) {
-  const y = imageYToBlockY(py, area.height, settings)
+  let solvedPixels = 0
+  let errorSum = 0
+  let maxRgbDistance = 0
+  let layerSum = 0
+  let minUsedLayers = Number.POSITIVE_INFINITY
+  let maxUsedLayers = 0
 
-  if (settings.layerAxis === 'z') {
-    const z =
-      layerIndex === null
-        ? Number(settings.startZ)
-        : Number(settings.startZ) +
-          Number(settings.layerDirection) * (layerIndex + 1) * Number(settings.layerStepBlocks)
-    return `fill ${Number(settings.startX) + x0} ${y} ${z} ${Number(settings.startX) + x1} ${y} ${z} ${blockState} replace`
-  }
+  function paletteIndexForQ32(q32Index) {
+    const existingPaletteIndex = q32ToPaletteIndex[q32Index]
+    if (existingPaletteIndex >= 0) return existingPaletteIndex
 
-  const x =
-    layerIndex === null
-      ? Number(settings.startX)
-      : Number(settings.startX) +
-        Number(settings.layerDirection) * (layerIndex + 1) * Number(settings.layerStepBlocks)
-  return `fill ${x} ${y} ${Number(settings.startZ) + x0} ${x} ${y} ${Number(settings.startZ) + x1} ${blockState} replace`
-}
+    const [r, g, b] = rgbFromQ32Index(q32Index)
+    const stackIndexes = lut.getBestStackIndexes(r, g, b)
+    const key = stackIndexes.join('|')
+    let paletteIndex = stackToIndex.get(key)
 
-function appendRunsForRow(lines, py, states, layerIndex, area, settings) {
-  let runStart = null
-  let runState = null
-
-  for (let px = 0; px < states.length; px += 1) {
-    const state = states[px]
-    if (state === runState) continue
-
-    if (runState !== null && runStart !== null) {
-      lines.push(rowFillCommand(py, runStart, px - 1, layerIndex, runState, area, settings))
+    if (paletteIndex === undefined) {
+      paletteIndex = stacks.length
+      stackToIndex.set(key, paletteIndex)
+      stacks.push(stackIndexes.map((index) => GLASS_LUT_COLOR_NAMES[index]))
+      colors.push(lut.renderStackRgb(stackIndexes))
+      lengths.push(stackIndexes.length)
     }
 
-    runStart = state === null ? null : px
-    runState = state
+    q32ToPaletteIndex[q32Index] = paletteIndex
+    return paletteIndex
   }
 
-  if (runState !== null && runStart !== null) {
-    lines.push(rowFillCommand(py, runStart, states.length - 1, layerIndex, runState, area, settings))
+  async function flushOverlay(force = false) {
+    if (!batchIndexes.length || (!force && batchIndexes.length < overlayBatchSize)) return
+
+    self.postMessage({
+      type: 'overlay',
+      solvedColors: solvedPixels,
+      uniqueColors: summary.buildablePixels,
+      label: `Mapped ${solvedPixels} of ${summary.buildablePixels} pixels`,
+      indexes: new Uint32Array(batchIndexes),
+      colors: new Uint8ClampedArray(batchColors),
+    })
+    batchIndexes.length = 0
+    batchColors.length = 0
+    await sleep()
   }
-}
 
-function appendBaseBuildCommands(lines, target, area, settings) {
-  if (!settings.placeBaseBlocks) return
+  for (let pixelIndex = 0; pixelIndex < target.width * target.height; pixelIndex += 1) {
+    if (!target.mask[pixelIndex]) continue
 
-  for (let py = 0; py < area.height; py += 1) {
-    const states = []
-    for (let px = 0; px < area.width; px += 1) {
-      states.push(target.mask[py * area.width + px] ? settings.baseBlockState : null)
+    const paletteIndex = paletteIndexForQ32(q32IndexFromRgb(target, pixelIndex))
+    const renderedColor = colors[paletteIndex]
+    const stackLength = lengths[paletteIndex]
+    const rgbIndex = pixelIndex * 3
+    const dr = target.rgb[rgbIndex] - renderedColor[0]
+    const dg = target.rgb[rgbIndex + 1] - renderedColor[1]
+    const db = target.rgb[rgbIndex + 2] - renderedColor[2]
+    const distance = Math.sqrt(dr * dr + dg * dg + db * db)
+
+    paletteIndexesByPixel[pixelIndex] = paletteIndex
+    solvedPixels += 1
+    errorSum += distance
+    maxRgbDistance = Math.max(maxRgbDistance, distance)
+    layerSum += stackLength
+    minUsedLayers = Math.min(minUsedLayers, stackLength)
+    maxUsedLayers = Math.max(maxUsedLayers, stackLength)
+    batchIndexes.push(pixelIndex)
+    batchColors.push(renderedColor[0], renderedColor[1], renderedColor[2])
+
+    if (batchIndexes.length >= overlayBatchSize) {
+      await flushOverlay()
+    } else if (solvedPixels % yieldBatchSize === 0) {
+      await sleep()
     }
-    appendRunsForRow(lines, py, states, null, area, settings)
-  }
-}
 
-function appendGlassBuildCommands(lines, target, paletteIndexesByPixel, palette, area, settings) {
-  for (let layer = 0; layer < settings.maxLayers; layer += 1) {
-    for (let py = 0; py < area.height; py += 1) {
-      const states = []
-      for (let px = 0; px < area.width; px += 1) {
-        const pixelIndex = py * area.width + px
-        if (!target.mask[pixelIndex]) {
-          states.push(null)
-          continue
-        }
-
-        const paletteIndex = paletteIndexesByPixel[pixelIndex]
-        const stack = palette.stacks[paletteIndex]
-        states.push(layer < stack.length ? glassBlockState(stack[layer]) : null)
-      }
-      appendRunsForRow(lines, py, states, layer, area, settings)
+    if (cancelled) {
+      self.postMessage({ type: 'cancelled' })
+      return null
     }
   }
-}
 
-function appendClearCommands(lines, area, settings) {
-  const minY = Number(settings.startY)
-  const maxY = Number(settings.startY) + area.height - 1
-  const depthStart = settings.placeBaseBlocks ? 0 : 1
-  const depthEnd = Number(settings.maxLayers)
-
-  if (settings.layerAxis === 'z') {
-    const x0 = Number(settings.startX)
-    const x1 = Number(settings.startX) + area.width - 1
-    const z0 = Number(settings.startZ) + Number(settings.layerDirection) * depthStart * Number(settings.layerStepBlocks)
-    const z1 = Number(settings.startZ) + Number(settings.layerDirection) * depthEnd * Number(settings.layerStepBlocks)
-    lines.push(
-      `fill ${Math.min(x0, x1)} ${minY} ${Math.min(z0, z1)} ${Math.max(x0, x1)} ${maxY} ${Math.max(z0, z1)} ${settings.clearBlockState} replace`,
-    )
-    return
-  }
-
-  const x0 = Number(settings.startX) + Number(settings.layerDirection) * depthStart * Number(settings.layerStepBlocks)
-  const x1 = Number(settings.startX) + Number(settings.layerDirection) * depthEnd * Number(settings.layerStepBlocks)
-  const z0 = Number(settings.startZ)
-  const z1 = Number(settings.startZ) + area.width - 1
-  lines.push(
-    `fill ${Math.min(x0, x1)} ${minY} ${Math.min(z0, z1)} ${Math.max(x0, x1)} ${maxY} ${Math.max(z0, z1)} ${settings.clearBlockState} replace`,
-  )
-}
-
-function buildMcfunctionFiles(target, paletteIndexesByPixel, palette, stats, settings) {
-  const area = { width: target.width, height: target.height }
-  const buildLines = [
-    '# Generated colored glass image',
-    `# Size: ${target.width}x${target.height} blocks`,
-    `# Base block: ${settings.placeBaseBlocks ? settings.baseBlockState : 'disabled'}`,
-    `# Layers: ${settings.minLayers}..${settings.maxLayers}`,
-    `# Buildable pixels: ${stats.buildablePixels}`,
-    `# Skipped pixels: ${stats.skippedPixels}`,
-    '',
-  ]
-  const clearLines = ['# Clear generated colored glass image', '']
-
-  appendBaseBuildCommands(buildLines, target, area, settings)
-  appendGlassBuildCommands(buildLines, target, paletteIndexesByPixel, palette, area, settings)
-  appendClearCommands(clearLines, area, settings)
+  await flushOverlay(true)
 
   return {
-    build: `${buildLines.join('\n')}\n`,
-    clear: `${clearLines.join('\n')}\n`,
-    buildCommandCount: buildLines.filter((line) => line && !line.startsWith('#')).length,
-    clearCommandCount: clearLines.filter((line) => line && !line.startsWith('#')).length,
+    paletteIndexesByPixel,
+    palette: { stacks, colors, lengths, indexes: [] },
+    stats: {
+      width: target.width,
+      height: target.height,
+      totalPixels: target.width * target.height,
+      buildablePixels: summary.buildablePixels,
+      skippedPixels: target.width * target.height - summary.buildablePixels,
+      uniqueColors: summary.uniqueColors,
+      paletteSize: stacks.length,
+      meanRgbDistance: errorSum / solvedPixels,
+      maxRgbDistance,
+      meanLayers: layerSum / solvedPixels,
+      minUsedLayers,
+      maxUsedLayers,
+    },
   }
 }
 
-function sanitizePathSegment(value, fallback) {
+function imageYToSchematicY(py, height, settings) {
+  if (settings.imageTopToHighY) return height - 1 - py
+  return py
+}
+
+function schematicDepthSize(settings) {
+  const maxLayers = Math.max(0, Number(settings.maxLayers))
+  const step = Math.max(1, Number(settings.layerStepBlocks))
+  const layerSpan = maxLayers > 0 ? (maxLayers - 1) * step + 1 : 0
+  return Math.max(1, layerSpan + (settings.placeBaseBlocks ? 1 : 0))
+}
+
+function schematicDepthForLayer(layer, depthSize, settings) {
+  const step = Math.max(1, Number(settings.layerStepBlocks))
+  const firstLayerDepth =
+    Number(settings.layerDirection) === -1
+      ? depthSize - 1 - (settings.placeBaseBlocks ? 1 : 0)
+      : settings.placeBaseBlocks
+        ? 1
+        : 0
+  return firstLayerDepth + (Number(settings.layerDirection) === -1 ? -layer * step : layer * step)
+}
+
+function schematicBaseDepth(depthSize, settings) {
+  return Number(settings.layerDirection) === -1 ? depthSize - 1 : 0
+}
+
+function normalizeBlockStateName(blockState) {
+  const value = String(blockState || 'minecraft:air').trim()
+  return value.includes(':') ? value : `minecraft:${value}`
+}
+
+function sanitizeFileBase(value, fallback) {
   const segment = String(value || fallback)
     .trim()
-    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/\.schem$/i, '')
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .split('')
+    .map((character) => (character.charCodeAt(0) < 32 ? '_' : character))
+    .join('')
+    .replace(/[.\s]+$/g, '')
   return segment || fallback
 }
 
-async function buildZip(files, settings) {
-  const zip = new JSZip()
-  const namespace = sanitizePathSegment(settings.namespace, 'glass_image').toLowerCase()
-  const version = APP_CONFIG.minecraftVersions.find((option) => option.version === settings.minecraftVersion)
+function schematicFileName(settings) {
+  return `${sanitizeFileBase(settings.schematicFileName, APP_CONFIG.defaults.schematicFileName)}.schem`
+}
 
-  zip.file(
-    'pack.mcmeta',
-    `${JSON.stringify(
-      {
-        pack: {
-          pack_format: Number(version?.packFormat ?? APP_CONFIG.minecraft.defaultPackFormat ?? 15),
-          description: `${settings.datapackName} generated colored glass image`,
-        },
-      },
-      null,
-      2,
-    )}\n`,
+function writeVarints(values) {
+  const bytes = []
+
+  for (let value of values) {
+    value = Number(value)
+    while ((value & -128) !== 0) {
+      bytes.push((value & 127) | 128)
+      value >>>= 7
+    }
+    bytes.push(value)
+  }
+
+  return bytes
+}
+
+class NbtWriter {
+  constructor() {
+    this.bytes = []
+    this.encoder = new TextEncoder()
+  }
+
+  writeByte(value) {
+    this.bytes.push(value & 255)
+  }
+
+  writeShort(value) {
+    this.bytes.push((value >> 8) & 255, value & 255)
+  }
+
+  writeInt(value) {
+    this.bytes.push((value >> 24) & 255, (value >> 16) & 255, (value >> 8) & 255, value & 255)
+  }
+
+  writeStringValue(value) {
+    const encoded = this.encoder.encode(String(value))
+    this.writeShort(encoded.length)
+    this.bytes.push(...encoded)
+  }
+
+  writeHeader(type, name) {
+    this.writeByte(type)
+    this.writeStringValue(name)
+  }
+
+  writeIntTag(name, value) {
+    this.writeHeader(3, name)
+    this.writeInt(value)
+  }
+
+  writeShortTag(name, value) {
+    this.writeHeader(2, name)
+    this.writeShort(value)
+  }
+
+  writeByteArrayTag(name, value) {
+    this.writeHeader(7, name)
+    this.writeInt(value.length)
+    for (const byte of value) {
+      this.bytes.push(byte & 255)
+    }
+  }
+
+  writeCompoundTag(name, writeBody) {
+    this.writeHeader(10, name)
+    writeBody()
+    this.writeByte(0)
+  }
+
+  finishRoot(writeBody) {
+    this.writeHeader(10, 'Schematic')
+    writeBody()
+    this.writeByte(0)
+    return new Uint8Array(this.bytes)
+  }
+}
+
+function buildSchematicData(target, paletteIndexesByPixel, palette, settings) {
+  const depthSize = schematicDepthSize(settings)
+  const width = settings.layerAxis === 'z' ? target.width : depthSize
+  const height = target.height
+  const length = settings.layerAxis === 'z' ? depthSize : target.width
+  const blockIndexes = new Uint32Array(width * height * length)
+  const blockPalette = ['minecraft:air']
+  const blockStateToIndex = new Map(blockPalette.map((state, index) => [state, index]))
+  let placedBlockCount = 0
+
+  function paletteIndexFor(blockState) {
+    const normalized = normalizeBlockStateName(blockState)
+    const existing = blockStateToIndex.get(normalized)
+    if (existing !== undefined) return existing
+    const nextIndex = blockPalette.length
+    blockStateToIndex.set(normalized, nextIndex)
+    blockPalette.push(normalized)
+    return nextIndex
+  }
+
+  function setBlockIndex(x, y, z, blockIndex) {
+    const index = (y * length + z) * width + x
+    if (blockIndexes[index] === 0) placedBlockCount += 1
+    blockIndexes[index] = blockIndex
+  }
+
+  function setPixelDepthIndex(px, py, depth, blockIndex) {
+    const y = imageYToSchematicY(py, target.height, settings)
+    if (settings.layerAxis === 'z') {
+      setBlockIndex(px, y, depth, blockIndex)
+      return
+    }
+    setBlockIndex(depth, y, px, blockIndex)
+  }
+
+  if (settings.placeBaseBlocks) {
+    const baseDepth = schematicBaseDepth(depthSize, settings)
+    const baseBlockIndex = paletteIndexFor(settings.baseBlockState)
+    for (let py = 0; py < target.height; py += 1) {
+      for (let px = 0; px < target.width; px += 1) {
+        if (target.mask[py * target.width + px]) {
+          setPixelDepthIndex(px, py, baseDepth, baseBlockIndex)
+        }
+      }
+    }
+  }
+
+  const stackBlockIndexes = palette.stacks.map((stack) =>
+    stack.map((blockName) => paletteIndexFor(glassBlockState(blockName))),
   )
-  zip.file(`data/${namespace}/functions/build.mcfunction`, files.build)
-  zip.file(`data/${namespace}/functions/clear.mcfunction`, files.clear)
 
-  return zip.generateAsync({ type: 'blob', compression: 'DEFLATE' })
+  for (let py = 0; py < target.height; py += 1) {
+    for (let px = 0; px < target.width; px += 1) {
+      const pixelIndex = py * target.width + px
+      if (!target.mask[pixelIndex]) continue
+
+      const paletteIndex = paletteIndexesByPixel[pixelIndex]
+      const stack = stackBlockIndexes[paletteIndex]
+      for (let layer = 0; layer < stack.length; layer += 1) {
+        setPixelDepthIndex(px, py, schematicDepthForLayer(layer, depthSize, settings), stack[layer])
+      }
+    }
+  }
+
+  return {
+    width,
+    height,
+    length,
+    blockPalette,
+    blockData: writeVarints(blockIndexes),
+    placedBlockCount,
+  }
+}
+
+function writeSchematicNbt(schematic) {
+  const writer = new NbtWriter()
+  return writer.finishRoot(() => {
+    writer.writeIntTag('PaletteMax', schematic.blockPalette.length)
+    writer.writeCompoundTag('Palette', () => {
+      schematic.blockPalette.forEach((blockState, index) => writer.writeIntTag(blockState, index))
+    })
+    writer.writeIntTag('Version', 2)
+    writer.writeShortTag('Length', schematic.length)
+    writer.writeCompoundTag('Metadata', () => {
+      writer.writeIntTag('WEOffsetX', 0)
+      writer.writeIntTag('WEOffsetY', 0)
+      writer.writeIntTag('WEOffsetZ', 0)
+    })
+    writer.writeShortTag('Height', schematic.height)
+    writer.writeIntTag('DataVersion', APP_CONFIG.minecraft.defaultDataVersion)
+    writer.writeByteArrayTag('BlockData', schematic.blockData)
+    writer.writeShortTag('Width', schematic.width)
+  })
+}
+
+function buildSchematicBlob(target, paletteIndexesByPixel, palette, settings) {
+  const schematic = buildSchematicData(target, paletteIndexesByPixel, palette, settings)
+  const compressed = gzip(writeSchematicNbt(schematic), { level: settings.useFastSolving ? 1 : 9 })
+  return {
+    blob: new Blob([compressed], { type: 'application/octet-stream' }),
+    metadata: schematic,
+  }
 }
 
 async function generate({ fileBuffer, fileType, settings }) {
@@ -490,6 +854,41 @@ async function generate({ fileBuffer, fileType, settings }) {
   const blob = new Blob([fileBuffer], { type: fileType })
   const imageBitmap = await createImageBitmap(blob)
   const target = prepareTargetImage(imageBitmap, settings)
+
+  if (settings.useFastSolving) {
+    const summary = summarizeFastLutTarget(target)
+
+    if (!summary.buildablePixels) throw new Error('No buildable pixels found. Check transparency settings.')
+
+    self.postMessage({
+      type: 'prepared',
+      width: target.width,
+      height: target.height,
+      buildablePixels: summary.buildablePixels,
+      skippedPixels: target.width * target.height - summary.buildablePixels,
+      uniqueColors: summary.uniqueColors,
+    })
+
+    const lut = await loadGlassLutQ32()
+    const solution = await buildFastLutSolution(target, lut, summary)
+    if (!solution) return
+
+    const schematic = buildSchematicBlob(target, solution.paletteIndexesByPixel, solution.palette, settings)
+
+    self.postMessage({
+      type: 'done',
+      schematicBlob: schematic.blob,
+      fileName: schematicFileName(settings),
+      stats: {
+        ...solution.stats,
+        dimensions: `${schematic.metadata.width} x ${schematic.metadata.height} x ${schematic.metadata.length}`,
+        schematicVolume: schematic.metadata.width * schematic.metadata.height * schematic.metadata.length,
+        placedBlockCount: schematic.metadata.placedBlockCount,
+      },
+    })
+    return
+  }
+
   const { groups, buildablePixels } = buildColorGroups(target)
 
   if (!buildablePixels) throw new Error('No buildable pixels found. Check transparency settings.')
@@ -590,20 +989,17 @@ async function generate({ fileBuffer, fileType, settings }) {
     maxUsedLayers: lengthSummary.max,
   }
 
-  const files = buildMcfunctionFiles(target, paletteIndexesByPixel, palette, stats, settings)
-  const zipBlob = await buildZip(files, settings)
+  const schematic = buildSchematicBlob(target, paletteIndexesByPixel, palette, settings)
 
   self.postMessage({
     type: 'done',
-    zipBlob,
-    fileName: `${sanitizePathSegment(settings.datapackName, 'glass_image')}.zip`,
+    schematicBlob: schematic.blob,
+    fileName: schematicFileName(settings),
     stats: {
       ...stats,
-      buildCommandCount: files.buildCommandCount,
-      clearCommandCount: files.clearCommandCount,
-      commandLimit: settings.commandLimit,
-      exceedsCommandLimit:
-        files.buildCommandCount > settings.commandLimit || files.clearCommandCount > settings.commandLimit,
+      dimensions: `${schematic.metadata.width} x ${schematic.metadata.height} x ${schematic.metadata.length}`,
+      schematicVolume: schematic.metadata.width * schematic.metadata.height * schematic.metadata.length,
+      placedBlockCount: schematic.metadata.placedBlockCount,
     },
   })
 }

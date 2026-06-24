@@ -4,9 +4,11 @@ export const APP_CONFIG = {
     maxY: 320,
     defaultCommandLimit: 20_000,
     defaultVersion: '1.20.1',
+    defaultDataVersion: 3465,
     minimumGlassVersion: '1.7.2',
   },
   defaults: {
+    schematicFileName: 'glass-image',
     datapackName: 'GlassImage',
     namespace: 'glass_image',
     minecraftVersion: '1.20.1',
@@ -18,7 +20,7 @@ export const APP_CONFIG = {
     layerStepBlocks: 1,
     commandLimit: 20_000,
     resultWidth: 320,
-    resultHeight: 0,
+    resultHeight: 300,
     lockAspectRatio: true,
     resizeFilter: 'LANCZOS',
     buildMaskResizeFilter: 'BOX',
@@ -27,10 +29,11 @@ export const APP_CONFIG = {
     transparentAlphaThreshold: 0,
     cleanTransparentResizeEdges: true,
     buildMaskCoverageThreshold: 128,
-    mirrorImageWidthAxis: true,
+    mirrorImageWidthAxis: false,
     imageMaxColors: 0,
     minLayers: 1,
-    maxLayers: 10,
+    maxLayers: 6,
+    useFastSolving: true,
     baseBlockRgb: [255, 255, 255],
     baseBlockState: 'minecraft:white_concrete',
     placeBaseBlocks: false,
@@ -166,14 +169,16 @@ export const APP_CONFIG = {
       'Flip the layer direction if the image should face the other side.',
     imageMaxColors:
       '0 keeps full color detail. Higher values reduce unique colors before solving and can make generation much faster.',
-    cleanTransparentResizeEdges:
-      'Uses a separate hard alpha mask so transparent PNG edges do not create unwanted glass pixels.',
     buildMaskCoverageThreshold:
       'A resized alpha-mask pixel must reach this value to become a buildable block.',
     mirrorImageWidthAxis:
-      'Flips the image width axis before converting pixels into Minecraft rows.',
-    minMaxLayers:
-      'Each image pixel is solved as a stack of stained glass blocks between these layer counts.',
+      'Reverses the image horizontally before converting pixels into Minecraft rows.',
+    useFastSolving:
+      'Fast processing with a bit of quality loss.',
+    maxLayers:
+      'How many glass blocks the solver may stack for each image pixel at most.',
+    layerStepBlocks:
+      '1 places layers next to each other. 2 leaves one empty block between each layer.',
     beamWidth:
       'How many candidate glass stacks survive each solver depth. Higher is slower but can improve matches.',
     colorBinSize:

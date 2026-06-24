@@ -19,7 +19,7 @@ export function StopModal({ open, onClose, onConfirm }) {
           </button>
         </div>
         <p className="text-sm leading-6 text-zinc-400">
-          Current progress will be discarded and no datapack will be downloaded.
+          Current progress will be discarded and no schematic will be downloaded.
         </p>
         <div className="mt-5 flex justify-end gap-2">
           <Button type="button" variant="subtle" onClick={onClose}>

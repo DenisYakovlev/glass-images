@@ -68,7 +68,7 @@ export function TextInput(props) {
   return (
     <input
       {...props}
-      className={`h-9 min-w-0 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none transition focus:border-violet-400 ${props.className || ''}`}
+      className={`h-9 min-w-0 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none transition focus:border-violet-400 disabled:cursor-not-allowed disabled:opacity-60 ${props.className || ''}`}
     />
   )
 }
@@ -82,9 +82,9 @@ export function SelectInput(props) {
   )
 }
 
-export function CheckboxField({ label, checked, onChange, help }) {
+export function CheckboxField({ label, checked, onChange, help, disabled = false }) {
   return (
-    <label className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200">
+    <label className={`flex min-w-0 items-center justify-between gap-3 rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 ${disabled ? 'opacity-60' : ''}`}>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate">{label}</span>
         <HelpTooltip text={help} />
@@ -92,8 +92,9 @@ export function CheckboxField({ label, checked, onChange, help }) {
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
-        className="h-4 w-4 shrink-0 accent-violet-400"
+        className="h-4 w-4 shrink-0 accent-violet-400 disabled:cursor-not-allowed"
       />
     </label>
   )
