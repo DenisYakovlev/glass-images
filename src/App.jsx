@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ConfigPanel } from './components/ConfigPanel'
 import { ImageWorkspace } from './components/ImageWorkspace'
 import { StopModal } from './components/StopModal'
-import { APP_CONFIG } from './config/appConfig'
+import { APP_CONFIG, WOOL_RGB } from './config/appConfig'
 import {
   calculateHeightForWidth,
   calculateWidthForHeight,
@@ -36,10 +36,16 @@ function calculateMinZoom(workspace, targetSize) {
 
 function sanitizeSettings(settings) {
   const useFastSolving = Boolean(settings.useFastSolving)
+  const addBackground = Boolean(settings.addBackground)
+  const backgroundWoolColorName = WOOL_RGB[settings.backgroundWoolColorName]
+    ? settings.backgroundWoolColorName
+    : APP_CONFIG.defaults.backgroundWoolColorName
 
   return {
     ...settings,
     useFastSolving,
+    addBackground,
+    backgroundWoolColorName,
     startX: Math.round(numberValue(settings.startX)),
     startY: Math.round(numberValue(settings.startY)),
     startZ: Math.round(numberValue(settings.startZ)),
@@ -61,7 +67,9 @@ function sanitizeSettings(settings) {
     newLayerMinImprovement: Math.max(0, numberValue(settings.newLayerMinImprovement, 0.35)),
     newLayerMinColorDelta: Math.max(0, numberValue(settings.newLayerMinColorDelta, 0.35)),
     perfectMatchDistance: Math.max(0, numberValue(settings.perfectMatchDistance, 0.01)),
-    baseBlockRgb: settings.baseBlockRgb.map((value) => Math.round(clamp(numberValue(value), 0, 255))),
+    baseBlockRgb: (addBackground ? WOOL_RGB[backgroundWoolColorName] : settings.baseBlockRgb).map((value) =>
+      Math.round(clamp(numberValue(value), 0, 255)),
+    ),
     alphaBackgroundRgb: settings.alphaBackgroundRgb.map((value) =>
       Math.round(clamp(numberValue(value), 0, 255)),
     ),
@@ -132,6 +140,12 @@ function drawGlassStackOverlay(canvas, renderData, textures) {
     const x = (targetPixelIndex % width) * GLASS_TILE_SIZE
     const y = Math.floor(targetPixelIndex / width) * GLASS_TILE_SIZE
     const stack = palette.stacks[paletteIndex]
+    const backgroundRgb = renderData.backgroundRgb
+
+    if (backgroundRgb) {
+      context.fillStyle = `rgb(${backgroundRgb.join(', ')})`
+      context.fillRect(x, y, GLASS_TILE_SIZE, GLASS_TILE_SIZE)
+    }
 
     for (const colorName of stack) {
       const texture = textures[colorName]

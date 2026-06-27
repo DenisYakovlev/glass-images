@@ -1,4 +1,4 @@
-import { HelpCircle } from 'lucide-react'
+import { ChevronDown, HelpCircle } from 'lucide-react'
 import { useState } from 'react'
 
 export function HelpTooltip({ text }) {
@@ -75,10 +75,16 @@ export function TextInput(props) {
 
 export function SelectInput(props) {
   return (
-    <select
-      {...props}
-      className={`h-9 min-w-0 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none transition focus:border-violet-400 ${props.className || ''}`}
-    />
+    <span className="relative min-w-0">
+      <select
+        {...props}
+        className={`h-9 w-full min-w-0 appearance-none rounded-md border border-zinc-700 bg-zinc-900 px-3 pr-9 text-sm text-zinc-100 outline-none transition focus:border-violet-400 ${props.className || ''}`}
+      />
+      <ChevronDown
+        className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500"
+        aria-hidden="true"
+      />
+    </span>
   )
 }
 

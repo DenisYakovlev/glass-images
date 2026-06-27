@@ -37,6 +37,8 @@ export const APP_CONFIG = {
     baseBlockRgb: [255, 255, 255],
     baseBlockState: 'minecraft:white_concrete',
     placeBaseBlocks: false,
+    addBackground: false,
+    backgroundWoolColorName: 'black',
     imageTopToHighY: true,
     clearBlockState: 'minecraft:air',
     perColorBeamWidth: 96,
@@ -172,7 +174,9 @@ export const APP_CONFIG = {
     buildMaskCoverageThreshold:
       'A resized alpha-mask pixel must reach this value to become a buildable block.',
     mirrorImageWidthAxis:
-      'Reverses the image horizontally before converting pixels into Minecraft rows.',
+      'Reverse image horizontally',
+    addBackground:
+      'Can improve quality of images with a lot of dark or white colors',
     useFastSolving:
       'Fast processing with a bit of quality loss.',
     maxLayers:
@@ -205,4 +209,23 @@ export const GLASS_RGBA = {
   green: [102, 127, 51, 0.460125612745],
   red: [153, 51, 51, 0.460125612745],
   black: [25, 25, 25, 0.460125612745],
+}
+
+export const WOOL_RGB = {
+  white: [234, 236, 237],
+  orange: [241, 118, 20],
+  magenta: [190, 69, 180],
+  light_blue: [58, 175, 217],
+  yellow: [249, 198, 40],
+  lime: [112, 185, 26],
+  pink: [238, 141, 172],
+  gray: [63, 68, 72],
+  light_gray: [142, 142, 135],
+  cyan: [21, 138, 145],
+  purple: [122, 42, 173],
+  blue: [53, 57, 157],
+  brown: [114, 72, 41],
+  green: [85, 110, 28],
+  red: [161, 39, 35],
+  black: [21, 21, 26],
 }

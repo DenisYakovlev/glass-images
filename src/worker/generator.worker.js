@@ -1,5 +1,5 @@
 import { gzip } from 'pako'
-import { APP_CONFIG, GLASS_RGBA } from '../config/appConfig'
+import { APP_CONFIG, GLASS_RGBA, WOOL_RGB } from '../config/appConfig'
 
 let cancelled = false
 const colorCache = new Map()
@@ -23,6 +23,8 @@ const GLASS_LUT_COLOR_NAMES = [
   'red',
   'black',
 ]
+const LUT_STACK_LAYER_COUNT = 6
+
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 const sleep = () => new Promise((resolve) => setTimeout(resolve, 0))
 const clampByte = (value) => clamp(Math.round(Number(value) || 0), 0, 255)
@@ -38,6 +40,10 @@ function normalizeGlassName(name) {
 
 function glassBlockState(name) {
   return `minecraft:${normalizeGlassName(name)}_stained_glass`
+}
+
+function woolBlockState(name) {
+  return `minecraft:${normalizeGlassName(name)}_wool`
 }
 
 function blendColorBehindGlass(baseRgb, glassRgba) {
@@ -58,11 +64,9 @@ function rgbDistance(a, b) {
   return Math.sqrt(rgbDistanceSq(a, b))
 }
 
-function renderLutStackRgb(stackIndexes) {
+function renderLutStackRgb(stackIndexes, baseRgb = [255, 255, 255]) {
   const alpha = GLASS_RGBA.white[3]
-  let r = 255
-  let g = 255
-  let b = 255
+  let [r, g, b] = baseRgb
 
   for (const glassIndex of stackIndexes) {
     const glass = GLASS_RGBA[GLASS_LUT_COLOR_NAMES[glassIndex]]
@@ -72,6 +76,11 @@ function renderLutStackRgb(stackIndexes) {
   }
 
   return [Math.round(r), Math.round(g), Math.round(b)]
+}
+
+function lutWhiteTargetForBase(targetRgb, baseRgb) {
+  const baseWeight = (1 - GLASS_RGBA.white[3]) ** LUT_STACK_LAYER_COUNT
+  return targetRgb.map((channel, index) => clampByte(channel - baseRgb[index] * baseWeight + 255 * baseWeight))
 }
 
 async function loadGlassLutQ32(url = `${import.meta.env.BASE_URL}lut_q32.glut`) {
@@ -325,6 +334,90 @@ function drawImageToCanvas(imageBitmap, width, height, filter) {
   return context.getImageData(0, 0, width, height)
 }
 
+function makeTransparentEdgeColorBleed(imageData, width, height, alphaThreshold) {
+  const pixelCount = width * height
+  const distances = new Uint16Array(pixelCount)
+  const red = new Uint8ClampedArray(pixelCount)
+  const green = new Uint8ClampedArray(pixelCount)
+  const blue = new Uint8ClampedArray(pixelCount)
+  const pixels = imageData.data
+  const maxDistance = 65535
+  let seedCount = 0
+  let fallbackSeedCount = 0
+
+  distances.fill(maxDistance)
+
+  function seedFromAlpha(minAlpha) {
+    for (let index = 0; index < pixelCount; index += 1) {
+      const sourceIndex = index * 4
+      if (pixels[sourceIndex + 3] < minAlpha) continue
+      distances[index] = 0
+      red[index] = pixels[sourceIndex]
+      green[index] = pixels[sourceIndex + 1]
+      blue[index] = pixels[sourceIndex + 2]
+      seedCount += 1
+    }
+  }
+
+  seedFromAlpha(224)
+
+  if (!seedCount) {
+    const fallbackAlpha = Math.min(255, Math.max(1, alphaThreshold + 1))
+    seedFromAlpha(fallbackAlpha)
+    fallbackSeedCount = seedCount
+  }
+
+  if (!seedCount) return null
+
+  function copyNearest(targetIndex, sourceIndex) {
+    const nextDistance = distances[sourceIndex] + 1
+    if (nextDistance >= distances[targetIndex]) return
+    distances[targetIndex] = nextDistance
+    red[targetIndex] = red[sourceIndex]
+    green[targetIndex] = green[sourceIndex]
+    blue[targetIndex] = blue[sourceIndex]
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x
+      if (x > 0) copyNearest(index, index - 1)
+      if (y > 0) {
+        copyNearest(index, index - width)
+        if (x > 0) copyNearest(index, index - width - 1)
+        if (x + 1 < width) copyNearest(index, index - width + 1)
+      }
+    }
+  }
+
+  for (let y = height - 1; y >= 0; y -= 1) {
+    for (let x = width - 1; x >= 0; x -= 1) {
+      const index = y * width + x
+      if (x + 1 < width) copyNearest(index, index + 1)
+      if (y + 1 < height) {
+        copyNearest(index, index + width)
+        if (x + 1 < width) copyNearest(index, index + width + 1)
+        if (x > 0) copyNearest(index, index + width - 1)
+      }
+    }
+  }
+
+  return {
+    red,
+    green,
+    blue,
+    useBleedForAlpha: fallbackSeedCount ? alphaThreshold : 255,
+  }
+}
+
+function hasBuildableTransparentPixels(imageData, mask) {
+  for (let index = 0; index < mask.length; index += 1) {
+    if (mask[index] && imageData.data[index * 4 + 3] < 255) return true
+  }
+
+  return false
+}
+
 function makeBuildMask(imageBitmap, targetWidth, targetHeight, settings) {
   const sourceCanvas = new OffscreenCanvas(imageBitmap.width, imageBitmap.height)
   const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true })
@@ -383,18 +476,26 @@ function prepareTargetImage(imageBitmap, settings) {
   const mask = makeBuildMask(imageBitmap, width, height, settings)
   const rgb = new Uint8Array(width * height * 3)
   const alphaBackground = settings.alphaBackgroundRgb.map(Number)
+  const transparentEdgeColors = settings.skipTransparentPixels && hasBuildableTransparentPixels(imageData, mask)
+    ? makeTransparentEdgeColorBleed(imageData, width, height, settings.transparentAlphaThreshold)
+    : null
 
   for (let index = 0; index < width * height; index += 1) {
     const sourceIndex = index * 4
     const alpha = imageData.data[sourceIndex + 3] / 255
     const targetIndex = index * 3
+
+    if (mask[index] && transparentEdgeColors) {
+      const shouldUseBleed = imageData.data[sourceIndex + 3] < transparentEdgeColors.useBleedForAlpha
+      rgb[targetIndex] = shouldUseBleed ? transparentEdgeColors.red[index] : imageData.data[sourceIndex]
+      rgb[targetIndex + 1] = shouldUseBleed ? transparentEdgeColors.green[index] : imageData.data[sourceIndex + 1]
+      rgb[targetIndex + 2] = shouldUseBleed ? transparentEdgeColors.blue[index] : imageData.data[sourceIndex + 2]
+      continue
+    }
+
     rgb[targetIndex] = Math.round(imageData.data[sourceIndex] * alpha + alphaBackground[0] * (1 - alpha))
-    rgb[targetIndex + 1] = Math.round(
-      imageData.data[sourceIndex + 1] * alpha + alphaBackground[1] * (1 - alpha),
-    )
-    rgb[targetIndex + 2] = Math.round(
-      imageData.data[sourceIndex + 2] * alpha + alphaBackground[2] * (1 - alpha),
-    )
+    rgb[targetIndex + 1] = Math.round(imageData.data[sourceIndex + 1] * alpha + alphaBackground[1] * (1 - alpha))
+    rgb[targetIndex + 2] = Math.round(imageData.data[sourceIndex + 2] * alpha + alphaBackground[2] * (1 - alpha))
   }
 
   if (settings.imageMaxColors > 0) {
@@ -508,13 +609,14 @@ function buildPalette(states) {
   return { stacks, colors, lengths, indexes }
 }
 
-async function buildFastLutSolution(target, lut, summary) {
+async function buildFastLutSolution(target, lut, summary, settings) {
   const q32ToPaletteIndex = new Int32Array(32 * 32 * 32).fill(-1)
   const stackToIndex = new Map()
   const stacks = []
   const colors = []
   const lengths = []
   const paletteIndexesByPixel = new Int32Array(target.width * target.height).fill(-1)
+  const baseRgb = settings.addBackground ? settings.baseBlockRgb.map(Number) : [255, 255, 255]
   const batchIndexes = []
   const batchColors = []
   const overlayBatchSize = 8192
@@ -531,8 +633,9 @@ async function buildFastLutSolution(target, lut, summary) {
     const existingPaletteIndex = q32ToPaletteIndex[q32Index]
     if (existingPaletteIndex >= 0) return existingPaletteIndex
 
-    const [r, g, b] = rgbFromQ32Index(q32Index)
-    const stackIndexes = lut.getBestStackIndexes(r, g, b)
+    const targetRgb = rgbFromQ32Index(q32Index)
+    const lookupRgb = settings.addBackground ? lutWhiteTargetForBase(targetRgb, baseRgb) : targetRgb
+    const stackIndexes = lut.getBestStackIndexes(...lookupRgb)
     const key = stackIndexes.join('|')
     let paletteIndex = stackToIndex.get(key)
 
@@ -540,7 +643,7 @@ async function buildFastLutSolution(target, lut, summary) {
       paletteIndex = stacks.length
       stackToIndex.set(key, paletteIndex)
       stacks.push(stackIndexes.map((index) => GLASS_LUT_COLOR_NAMES[index]))
-      colors.push(lut.renderStackRgb(stackIndexes))
+      colors.push(lut.renderStackRgb(stackIndexes, baseRgb))
       lengths.push(stackIndexes.length)
     }
 
@@ -629,15 +732,19 @@ function schematicDepthSize(settings) {
   const maxLayers = Math.max(0, Number(settings.maxLayers))
   const step = Math.max(1, Number(settings.layerStepBlocks))
   const layerSpan = maxLayers > 0 ? (maxLayers - 1) * step + 1 : 0
-  return Math.max(1, layerSpan + (settings.placeBaseBlocks ? 1 : 0))
+  return Math.max(1, layerSpan + (hasSchematicBaseBlock(settings) ? 1 : 0))
+}
+
+function hasSchematicBaseBlock(settings) {
+  return Boolean(settings.addBackground || settings.placeBaseBlocks)
 }
 
 function schematicDepthForLayer(layer, depthSize, settings) {
   const step = Math.max(1, Number(settings.layerStepBlocks))
   const firstLayerDepth =
     Number(settings.layerDirection) === -1
-      ? depthSize - 1 - (settings.placeBaseBlocks ? 1 : 0)
-      : settings.placeBaseBlocks
+      ? depthSize - 1 - (hasSchematicBaseBlock(settings) ? 1 : 0)
+      : hasSchematicBaseBlock(settings)
         ? 1
         : 0
   return firstLayerDepth + (Number(settings.layerDirection) === -1 ? -layer * step : layer * step)
@@ -666,6 +773,20 @@ function sanitizeFileBase(value, fallback) {
 
 function schematicFileName(settings) {
   return `${sanitizeFileBase(settings.schematicFileName, APP_CONFIG.defaults.schematicFileName)}.schem`
+}
+
+function normalizeGenerationSettings(settings) {
+  if (!settings.addBackground) return settings
+
+  const backgroundWoolColorName = WOOL_RGB[settings.backgroundWoolColorName]
+    ? settings.backgroundWoolColorName
+    : APP_CONFIG.defaults.backgroundWoolColorName
+
+  return {
+    ...settings,
+    backgroundWoolColorName,
+    baseBlockRgb: WOOL_RGB[backgroundWoolColorName],
+  }
 }
 
 function writeVarints(values) {
@@ -779,7 +900,17 @@ function buildSchematicData(target, paletteIndexesByPixel, palette, settings) {
     setBlockIndex(depth, y, px, blockIndex)
   }
 
-  if (settings.placeBaseBlocks) {
+  if (settings.addBackground) {
+    const baseDepth = schematicBaseDepth(depthSize, settings)
+    const baseBlockIndex = paletteIndexFor(woolBlockState(settings.backgroundWoolColorName))
+    for (let py = 0; py < target.height; py += 1) {
+      for (let px = 0; px < target.width; px += 1) {
+        if (target.mask[py * target.width + px]) {
+          setPixelDepthIndex(px, py, baseDepth, baseBlockIndex)
+        }
+      }
+    }
+  } else if (settings.placeBaseBlocks) {
     const baseDepth = schematicBaseDepth(depthSize, settings)
     const baseBlockIndex = paletteIndexFor(settings.baseBlockState)
     for (let py = 0; py < target.height; py += 1) {
@@ -850,6 +981,7 @@ function buildSchematicBlob(target, paletteIndexesByPixel, palette, settings) {
 
 async function generate({ fileBuffer, fileType, settings }) {
   cancelled = false
+  settings = normalizeGenerationSettings(settings)
   const blob = new Blob([fileBuffer], { type: fileType })
   const imageBitmap = await createImageBitmap(blob)
   const target = prepareTargetImage(imageBitmap, settings)
@@ -869,7 +1001,7 @@ async function generate({ fileBuffer, fileType, settings }) {
     })
 
     const lut = await loadGlassLutQ32()
-    const solution = await buildFastLutSolution(target, lut, summary)
+    const solution = await buildFastLutSolution(target, lut, summary, settings)
     if (!solution) return
 
     const schematic = buildSchematicBlob(target, solution.paletteIndexesByPixel, solution.palette, settings)
@@ -882,6 +1014,7 @@ async function generate({ fileBuffer, fileType, settings }) {
         width: target.width,
         height: target.height,
         paletteIndexesByPixel: solution.paletteIndexesByPixel,
+        backgroundRgb: settings.addBackground ? settings.baseBlockRgb : null,
         palette: {
           stacks: solution.palette.stacks,
           colors: solution.palette.colors,
@@ -1007,6 +1140,7 @@ async function generate({ fileBuffer, fileType, settings }) {
       width: target.width,
       height: target.height,
       paletteIndexesByPixel,
+      backgroundRgb: settings.addBackground ? settings.baseBlockRgb : null,
       palette: {
         stacks: palette.stacks,
         colors: palette.colors,

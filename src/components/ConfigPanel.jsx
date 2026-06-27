@@ -8,10 +8,15 @@ import {
   RefreshCw,
   SlidersHorizontal,
 } from 'lucide-react'
-import { APP_CONFIG, GLASS_RGBA } from '../config/appConfig'
+import { APP_CONFIG, GLASS_RGBA, WOOL_RGB } from '../config/appConfig'
 import { Button, CheckboxField, Field, Section, SelectInput, TextInput } from './FormControls'
 
 function formatGlassColorName(name) {
+  const label = name.replaceAll('_', ' ')
+  return label.charAt(0).toUpperCase() + label.slice(1)
+}
+
+function formatWoolColorName(name) {
   const label = name.replaceAll('_', ' ')
   return label.charAt(0).toUpperCase() + label.slice(1)
 }
@@ -52,6 +57,37 @@ export function ConfigPanel({
                 onChange={(event) => onSettingChange('schematicFileName', event.target.value)}
               />
             </Field>
+            <CheckboxField
+              label="Add background"
+              checked={settings.addBackground}
+              onChange={(checked) => onSettingChange('addBackground', checked)}
+              help={APP_CONFIG.help.addBackground}
+            />
+            {settings.addBackground ? (
+              <Field label="Wool color">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {Object.entries(WOOL_RGB).map(([colorName, rgb]) => (
+                    <label
+                      key={colorName}
+                      className="flex min-w-0 items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-2 text-xs text-zinc-300"
+                    >
+                      <input
+                        type="radio"
+                        name="backgroundWoolColorName"
+                        checked={settings.backgroundWoolColorName === colorName}
+                        onChange={() => onSettingChange('backgroundWoolColorName', colorName)}
+                        className="h-3.5 w-3.5 shrink-0 accent-violet-400"
+                      />
+                      <span
+                        className="h-3 w-3 shrink-0 rounded-sm border border-black/30"
+                        style={{ backgroundColor: `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})` }}
+                      />
+                      <span className="truncate">{formatWoolColorName(colorName)}</span>
+                    </label>
+                  ))}
+                </div>
+              </Field>
+            ) : null}
           </Section>
 
           <Section title="Image Configuration" icon={ImagePlus}>
