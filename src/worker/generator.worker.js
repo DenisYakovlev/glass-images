@@ -23,7 +23,6 @@ const GLASS_LUT_COLOR_NAMES = [
   'red',
   'black',
 ]
-
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 const sleep = () => new Promise((resolve) => setTimeout(resolve, 0))
 const clampByte = (value) => clamp(Math.round(Number(value) || 0), 0, 255)
@@ -879,6 +878,15 @@ async function generate({ fileBuffer, fileType, settings }) {
       type: 'done',
       schematicBlob: schematic.blob,
       fileName: schematicFileName(settings),
+      preview: {
+        width: target.width,
+        height: target.height,
+        paletteIndexesByPixel: solution.paletteIndexesByPixel,
+        palette: {
+          stacks: solution.palette.stacks,
+          colors: solution.palette.colors,
+        },
+      },
       stats: {
         ...solution.stats,
         dimensions: `${schematic.metadata.width} x ${schematic.metadata.height} x ${schematic.metadata.length}`,
@@ -995,6 +1003,15 @@ async function generate({ fileBuffer, fileType, settings }) {
     type: 'done',
     schematicBlob: schematic.blob,
     fileName: schematicFileName(settings),
+    preview: {
+      width: target.width,
+      height: target.height,
+      paletteIndexesByPixel,
+      palette: {
+        stacks: palette.stacks,
+        colors: palette.colors,
+      },
+    },
     stats: {
       ...stats,
       dimensions: `${schematic.metadata.width} x ${schematic.metadata.height} x ${schematic.metadata.length}`,

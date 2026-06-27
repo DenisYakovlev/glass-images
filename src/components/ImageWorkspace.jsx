@@ -1,4 +1,4 @@
-import { FolderOpen, Hand, ImagePlus, Maximize2, X } from 'lucide-react'
+import { FolderOpen, Hand, ImagePlus, Maximize2, Palette, X } from 'lucide-react'
 import { Button } from './FormControls'
 
 export function ImageWorkspace({
@@ -14,6 +14,9 @@ export function ImageWorkspace({
   zoom,
   minZoom,
   maxZoom,
+  showGlassStacks,
+  canShowGlassStacks,
+  hasGlassStackPreview,
   overlayCanvasRef,
   fileInputRef,
   onImportFile,
@@ -26,6 +29,7 @@ export function ImageWorkspace({
   onWheel,
   onDoubleClick,
   onFitView,
+  onToggleGlassStacks,
   onRemoveImage,
   onZoomChange,
 }) {
@@ -39,7 +43,7 @@ export function ImageWorkspace({
   return (
     <section
       ref={workspaceRef}
-      className={`relative z-0 h-full min-h-0 overflow-hidden border-b border-zinc-800 bg-[radial-gradient(circle_at_center,#27272a_1px,transparent_1px)] [background-size:24px_24px] lg:border-b-0 lg:border-r ${isDraggingOver ? 'ring-2 ring-inset ring-violet-400' : ''}`}
+      className={`relative z-0 h-full min-h-0 overflow-hidden border-b border-zinc-800 lg:border-b-0 lg:border-r ${showGlassStacks ? 'bg-[#78A7FF]' : 'bg-[radial-gradient(circle_at_center,#27272a_1px,transparent_1px)] [background-size:24px_24px]'} ${isDraggingOver ? 'ring-2 ring-inset ring-violet-400' : ''}`}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
@@ -79,7 +83,7 @@ export function ImageWorkspace({
               <img
                 src={previewUrl}
                 alt={image.name}
-                className={`absolute inset-0 h-full w-full select-none object-fill [image-rendering:pixelated] ${isRunning ? 'opacity-25' : 'opacity-100'}`}
+                className={`absolute inset-0 h-full w-full select-none object-fill [image-rendering:pixelated] ${isRunning ? 'opacity-25' : hasGlassStackPreview ? 'opacity-0' : 'opacity-100'}`}
                 draggable="false"
               />
             ) : null}
@@ -128,6 +132,22 @@ export function ImageWorkspace({
               title="Fit image to view"
             >
               <Maximize2 className="h-5 w-5" />
+            </Button>
+            <Button
+              type="button"
+              disabled={!canShowGlassStacks}
+              onClick={onToggleGlassStacks}
+              className="h-10 w-10 px-0 disabled:cursor-not-allowed disabled:border-zinc-800 disabled:text-zinc-600 [&_svg]:h-5 [&_svg]:w-5"
+              aria-label="Toggle glass stack preview"
+              aria-pressed={showGlassStacks}
+              title="Toggle glass stack preview"
+              style={
+                showGlassStacks
+                  ? { backgroundColor: '#bfdbfe', borderColor: '#dbeafe', color: '#09090b' }
+                  : undefined
+              }
+            >
+              <Palette className="h-5 w-5" />
             </Button>
             <input
               type="range"

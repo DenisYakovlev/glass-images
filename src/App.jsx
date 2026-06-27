@@ -12,6 +12,16 @@ import { clamp, numberValue } from './utils/math'
 const initialSettings = APP_CONFIG.defaults
 const MIN_WORKSPACE_IMAGE_RATIO = 0.3
 const MAX_ZOOM = 16
+const GLASS_TILE_SIZE = 16
+const MINECRAFT_SKY_RGB = [120, 167, 255]
+const GLASS_TEXTURE_NAMES = APP_CONFIG.defaults.glassColorNames
+const GLASS_TEXTURE_URLS = Object.fromEntries(
+  GLASS_TEXTURE_NAMES.map((name) => [
+    name,
+    `${import.meta.env.BASE_URL}glass/${name}_stained_glass.png`,
+  ]),
+)
+let glassTexturesPromise = null
 
 function calculateMinZoom(workspace, targetSize) {
   const rect = workspace?.getBoundingClientRect()
@@ -62,10 +72,79 @@ function createDownloadUrl(blob) {
   return URL.createObjectURL(blob)
 }
 
+function displayPixelIndex(pixelIndex, width, mirrorForDisplay) {
+  if (!mirrorForDisplay) return pixelIndex
+  return Math.floor(pixelIndex / width) * width + (width - 1 - (pixelIndex % width))
+}
+
+async function loadGlassTextures() {
+  if (!glassTexturesPromise) {
+    glassTexturesPromise = Promise.all(
+      Object.entries(GLASS_TEXTURE_URLS).map(async ([name, url]) => {
+        const response = await fetch(url)
+        if (!response.ok) throw new Error(`Failed to load ${name} glass texture.`)
+        return [name, await createImageBitmap(await response.blob())]
+      }),
+    ).then((entries) => Object.fromEntries(entries))
+  }
+
+  return glassTexturesPromise
+}
+
+function drawPaletteColorOverlay(canvas, renderData) {
+  const { width, height, mirrorForDisplay, palette, paletteIndexesByPixel } = renderData
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d')
+  const imageData = context.createImageData(width, height)
+
+  for (let pixelIndex = 0; pixelIndex < paletteIndexesByPixel.length; pixelIndex += 1) {
+    const paletteIndex = paletteIndexesByPixel[pixelIndex]
+    if (paletteIndex < 0) continue
+
+    const targetPixelIndex = displayPixelIndex(pixelIndex, width, mirrorForDisplay)
+    const offset = targetPixelIndex * 4
+    const color = palette.colors[paletteIndex]
+    imageData.data[offset] = Math.round(color[0])
+    imageData.data[offset + 1] = Math.round(color[1])
+    imageData.data[offset + 2] = Math.round(color[2])
+    imageData.data[offset + 3] = 255
+  }
+
+  context.putImageData(imageData, 0, 0)
+  return imageData
+}
+
+function drawGlassStackOverlay(canvas, renderData, textures) {
+  const { width, height, mirrorForDisplay, palette, paletteIndexesByPixel } = renderData
+  canvas.width = width * GLASS_TILE_SIZE
+  canvas.height = height * GLASS_TILE_SIZE
+  const context = canvas.getContext('2d')
+  context.imageSmoothingEnabled = false
+  context.fillStyle = `rgb(${MINECRAFT_SKY_RGB.join(', ')})`
+  context.fillRect(0, 0, canvas.width, canvas.height)
+
+  for (let pixelIndex = 0; pixelIndex < paletteIndexesByPixel.length; pixelIndex += 1) {
+    const paletteIndex = paletteIndexesByPixel[pixelIndex]
+    if (paletteIndex < 0) continue
+
+    const targetPixelIndex = displayPixelIndex(pixelIndex, width, mirrorForDisplay)
+    const x = (targetPixelIndex % width) * GLASS_TILE_SIZE
+    const y = Math.floor(targetPixelIndex / width) * GLASS_TILE_SIZE
+    const stack = palette.stacks[paletteIndex]
+
+    for (const colorName of stack) {
+      const texture = textures[colorName]
+      if (texture) context.drawImage(texture, x, y, GLASS_TILE_SIZE, GLASS_TILE_SIZE)
+    }
+  }
+}
+
 function App() {
   const [settings, setSettings] = useState(initialSettings)
   const [image, setImage] = useState(null)
   const [previewUrl, setPreviewUrl] = useState('')
+  const [showGlassStacks, setShowGlassStacks] = useState(false)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
@@ -76,6 +155,7 @@ function App() {
   const [stopModalOpen, setStopModalOpen] = useState(false)
   const [download, setDownload] = useState(null)
   const [stats, setStats] = useState(null)
+  const [renderData, setRenderData] = useState(null)
   const [runtimeError, setRuntimeError] = useState('')
 
   const fileRef = useRef(null)
@@ -111,37 +191,6 @@ function App() {
     return errors
   }, [image, settings, targetSize.height, targetSize.width])
 
-  const updateSetting = useCallback((key, value) => {
-    setSettings((current) => {
-      if (key !== 'lockAspectRatio') return { ...current, [key]: value }
-
-      const lockAspectRatio = Boolean(value)
-      if (!lockAspectRatio || !image) return { ...current, lockAspectRatio }
-
-      const resultHeight = Math.max(1, Math.round(numberValue(current.resultHeight, 1)))
-      return {
-        ...current,
-        lockAspectRatio,
-        resultHeight,
-        resultWidth: calculateWidthForHeight(image, resultHeight),
-      }
-    })
-  }, [image])
-
-  const updateDimension = useCallback(
-    (key, value) => {
-      const nextValue = Math.max(1, Math.round(numberValue(value, 1)))
-      setSettings((current) => {
-        if (!current.lockAspectRatio || !image) return { ...current, [key]: nextValue }
-        if (key === 'resultWidth') {
-          return { ...current, resultWidth: nextValue, resultHeight: calculateHeightForWidth(image, nextValue) }
-        }
-        return { ...current, resultHeight: nextValue, resultWidth: calculateWidthForHeight(image, nextValue) }
-      })
-    },
-    [image],
-  )
-
   const clearDownload = useCallback(() => {
     if (downloadUrlRef.current) {
       URL.revokeObjectURL(downloadUrlRef.current)
@@ -150,9 +199,30 @@ function App() {
     setDownload(null)
   }, [])
 
+  const clearOverlay = useCallback(() => {
+    const canvas = overlayCanvasRef.current
+    if (!canvas) return
+    canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+    canvas.width = targetSize.width
+    canvas.height = targetSize.height
+    overlayImageRef.current = null
+  }, [targetSize.height, targetSize.width])
+
+  const clearGeneratedResult = useCallback(() => {
+    clearDownload()
+    clearOverlay()
+    setStats(null)
+    setRenderData(null)
+    setShowGlassStacks(false)
+    setRuntimeError('')
+    setGeneration({ status: 'idle', progress: 0, label: '' })
+  }, [clearDownload, clearOverlay])
+
   const importFile = useCallback(
     async (file) => {
       if (!file?.type.startsWith('image/')) return
+      workerRef.current?.terminate()
+      workerRef.current = null
       const bitmap = await createImageBitmap(file)
       const nextImage = { name: file.name || 'clipboard-image.png', width: bitmap.width, height: bitmap.height }
       const preferredHeight = Math.max(1, Math.round(numberValue(settings.resultHeight, APP_CONFIG.defaults.resultHeight)))
@@ -171,12 +241,46 @@ function App() {
       }))
       setPan({ x: 0, y: 0 })
       setZoom(1)
-      setStats(null)
-      setRuntimeError('')
-      clearDownload()
+      clearGeneratedResult()
       bitmap.close?.()
     },
-    [clearDownload, settings.lockAspectRatio, settings.resultHeight, settings.resultWidth],
+    [clearGeneratedResult, settings.lockAspectRatio, settings.resultHeight, settings.resultWidth],
+  )
+
+  const updateSetting = useCallback(
+    (key, value) => {
+      clearGeneratedResult()
+      setSettings((current) => {
+        if (key !== 'lockAspectRatio') return { ...current, [key]: value }
+
+        const lockAspectRatio = Boolean(value)
+        if (!lockAspectRatio || !image) return { ...current, lockAspectRatio }
+
+        const resultHeight = Math.max(1, Math.round(numberValue(current.resultHeight, 1)))
+        return {
+          ...current,
+          lockAspectRatio,
+          resultHeight,
+          resultWidth: calculateWidthForHeight(image, resultHeight),
+        }
+      })
+    },
+    [clearGeneratedResult, image],
+  )
+
+  const updateDimension = useCallback(
+    (key, value) => {
+      clearGeneratedResult()
+      const nextValue = Math.max(1, Math.round(numberValue(value, 1)))
+      setSettings((current) => {
+        if (!current.lockAspectRatio || !image) return { ...current, [key]: nextValue }
+        if (key === 'resultWidth') {
+          return { ...current, resultWidth: nextValue, resultHeight: calculateHeightForWidth(image, nextValue) }
+        }
+        return { ...current, resultHeight: nextValue, resultWidth: calculateWidthForHeight(image, nextValue) }
+      })
+    },
+    [clearGeneratedResult, image],
   )
 
   const removeImage = useCallback(() => {
@@ -186,13 +290,8 @@ function App() {
     if (fileInputRef.current) fileInputRef.current.value = ''
     setImage(null)
     setPreviewUrl('')
-    setStats(null)
-    setRuntimeError('')
-    setGeneration({ status: 'idle', progress: 0, label: '' })
-    clearDownload()
-    const canvas = overlayCanvasRef.current
-    canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
-  }, [clearDownload])
+    clearGeneratedResult()
+  }, [clearGeneratedResult])
 
   useEffect(() => {
     if (!image || !fileRef.current) return undefined
@@ -262,6 +361,37 @@ function App() {
     [],
   )
 
+  useEffect(() => {
+    if (!renderData || generation.status === 'running') return undefined
+
+    let disposed = false
+    const canvas = overlayCanvasRef.current
+    if (!canvas) return undefined
+
+    async function renderGeneratedPreview() {
+      if (showGlassStacks) {
+        const textures = await loadGlassTextures()
+        if (!disposed) {
+          drawGlassStackOverlay(canvas, renderData, textures)
+          overlayImageRef.current = null
+        }
+        return
+      }
+
+      if (!disposed) {
+        overlayImageRef.current = drawPaletteColorOverlay(canvas, renderData)
+      }
+    }
+
+    renderGeneratedPreview().catch((error) => {
+      if (!disposed) setRuntimeError(error.message)
+    })
+
+    return () => {
+      disposed = true
+    }
+  }, [generation.status, renderData, showGlassStacks])
+
   const handleDrop = useCallback(
     (event) => {
       event.preventDefault()
@@ -280,16 +410,13 @@ function App() {
       ? {
           download,
           stats,
-          overlay:
-            overlayCanvas.width > 0 && overlayCanvas.height > 0
-              ? overlayCanvas.getContext('2d').getImageData(0, 0, overlayCanvas.width, overlayCanvas.height)
-              : null,
-          overlayWidth: overlayCanvas.width,
-          overlayHeight: overlayCanvas.height,
+          renderData,
         }
       : null
 
     setRuntimeError('')
+    setRenderData(null)
+    setShowGlassStacks(false)
     setGeneration({ status: 'running', progress: 0, label: 'Preparing image' })
     const generationSettings = sanitizeSettings(settings)
     const shouldMirrorOverlay = generationSettings.mirrorImageWidthAxis !== settings.mirrorImageWidthAxis
@@ -320,12 +447,9 @@ function App() {
         if (imageData) {
           for (let index = 0; index < message.indexes.length; index += 1) {
             const pixelIndex = message.indexes[index]
-            const displayPixelIndex = shouldMirrorOverlay
-              ? Math.floor(pixelIndex / targetSize.width) * targetSize.width +
-                (targetSize.width - 1 - (pixelIndex % targetSize.width))
-              : pixelIndex
+            const displayPixel = displayPixelIndex(pixelIndex, targetSize.width, shouldMirrorOverlay)
             const colorIndex = index * 3
-            const offset = displayPixelIndex * 4
+            const offset = displayPixel * 4
             imageData.data[offset] = message.colors[colorIndex]
             imageData.data[offset + 1] = message.colors[colorIndex + 1]
             imageData.data[offset + 2] = message.colors[colorIndex + 2]
@@ -347,23 +471,25 @@ function App() {
         downloadUrlRef.current = url
         setDownload({ url, fileName: message.fileName })
         setStats(message.stats)
+        setRenderData({
+          ...message.preview,
+          mirrorForDisplay: shouldMirrorOverlay,
+        })
         setGeneration({ status: 'done', progress: 100, label: 'Schematic ready' })
         worker.terminate()
         workerRef.current = null
       }
 
       if (message.type === 'cancelled') {
-        if (previousResult?.overlay) {
-          overlayCanvas.width = previousResult.overlayWidth
-          overlayCanvas.height = previousResult.overlayHeight
-          overlayImageRef.current = previousResult.overlay
-          overlayCanvas.getContext('2d').putImageData(previousResult.overlay, 0, 0)
+        if (previousResult?.renderData) {
+          overlayImageRef.current = drawPaletteColorOverlay(overlayCanvas, previousResult.renderData)
         } else {
           overlayCanvas.getContext('2d').clearRect(0, 0, overlayCanvas.width, overlayCanvas.height)
           overlayImageRef.current = null
         }
         setDownload(previousResult?.download ?? null)
         setStats(previousResult?.stats ?? null)
+        setRenderData(previousResult?.renderData ?? null)
         setGeneration(
           previousResult
             ? { status: 'done', progress: 100, label: 'Schematic ready' }
@@ -375,6 +501,8 @@ function App() {
 
       if (message.type === 'error') {
         setRuntimeError(message.message)
+        setRenderData(null)
+        setShowGlassStacks(false)
         setGeneration({ status: 'idle', progress: 0, label: '' })
         worker.terminate()
         workerRef.current = null
@@ -388,7 +516,7 @@ function App() {
       fileType: fileRef.current.type,
       settings: generationSettings,
     })
-  }, [download, settings, stats, targetSize.height, targetSize.width, validation])
+  }, [download, renderData, settings, stats, targetSize.height, targetSize.width, validation])
 
   const confirmStop = useCallback(() => {
     workerRef.current?.postMessage({ type: 'cancel' })
@@ -396,14 +524,18 @@ function App() {
     setGeneration((current) => ({ ...current, label: 'Stopping after current color batch' }))
   }, [])
 
-  const toggleGlassColor = useCallback((colorName, checked) => {
-    setSettings((current) => ({
-      ...current,
-      glassColorNames: checked
-        ? [...current.glassColorNames, colorName]
-        : current.glassColorNames.filter((name) => name !== colorName),
-    }))
-  }, [])
+  const toggleGlassColor = useCallback(
+    (colorName, checked) => {
+      clearGeneratedResult()
+      setSettings((current) => ({
+        ...current,
+        glassColorNames: checked
+          ? [...current.glassColorNames, colorName]
+          : current.glassColorNames.filter((name) => name !== colorName),
+      }))
+    },
+    [clearGeneratedResult],
+  )
 
   const fitImageToWorkspace = useCallback(() => {
     const workspace = workspaceRef.current
@@ -513,6 +645,9 @@ function App() {
           zoom={zoom}
           minZoom={minZoom}
           maxZoom={MAX_ZOOM}
+          showGlassStacks={showGlassStacks}
+          canShowGlassStacks={Boolean(renderData)}
+          hasGlassStackPreview={showGlassStacks && Boolean(renderData)}
           overlayCanvasRef={overlayCanvasRef}
           fileInputRef={fileInputRef}
           onImportFile={importFile}
@@ -528,6 +663,7 @@ function App() {
           onWheel={handleWheel}
           onDoubleClick={handleDoubleClick}
           onFitView={fitImageToWorkspace}
+          onToggleGlassStacks={() => setShowGlassStacks((current) => !current)}
           onRemoveImage={removeImage}
           onZoomChange={(value) => setZoom(clamp(value, minZoom, MAX_ZOOM))}
         />
